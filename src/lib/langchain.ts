@@ -1,4 +1,3 @@
-import { ConversationalRetrievalQAChain } from "langchain/chains";
 import { getVectorStore } from "./vector-store";
 import { getPineconeClient } from "./pinecone-client";
 import {
@@ -7,7 +6,13 @@ import {
   LangChainStream,
 } from "ai-stream-experimental";
 import { streamingModel, nonStreamingModel } from "./llm";
-import { STANDALONE_QUESTION_TEMPLATE, QA_TEMPLATE } from "./prompt-templates";
+import {
+  ChatPromptTemplate,
+  MessagesPlaceholder,
+} from "@langchain/core/prompts";
+import { createHistoryAwareRetriever } from "langchain/chains/history_aware_retriever";
+import { createStuffDocumentsChain } from "langchain/chains/combine_documents";
+import { createRetrievalChain } from "langchain/chains/retrieval";
 
 type callChainArgs = {
   question: string;
@@ -25,41 +30,65 @@ export async function callChain({ question, chatHistory }: callChainArgs) {
     });
     const data = new experimental_StreamData();
 
-    const chain = ConversationalRetrievalQAChain.fromLLM(
-      streamingModel,
-      vectorStore.asRetriever(),
-      {
-        qaTemplate: QA_TEMPLATE,
-        questionGeneratorTemplate: STANDALONE_QUESTION_TEMPLATE,
-        returnSourceDocuments: true, //default 4
-        questionGeneratorChainOptions: {
-          llm: nonStreamingModel,
-        },
-      }
-    );
+    // Create the contextualize question prompt
+    const contextualizeQSystemPrompt = `
+      Given a chat history and the latest user question
+      which might reference context in the chat history,
+      formulate a standalone question which can be understood
+      without the chat history. Do NOT answer the question, just
+      reformulate it if needed and otherwise return it as is.`;
+    const contextualizeQPrompt = ChatPromptTemplate.fromMessages([
+      ["system", contextualizeQSystemPrompt],
+      new MessagesPlaceholder("chat_history"),
+      ["human", "{input}"],
+    ]);
+    const historyAwareRetriever = await createHistoryAwareRetriever({
+      llm: nonStreamingModel,
+      retriever: vectorStore.asRetriever(),
+      rephrasePrompt: contextualizeQPrompt,
+    });
+
+    // Create the question-answering prompt
+    const qaSystemPrompt = `
+      You are an assistant for question-answering tasks. Use
+      the following pieces of retrieved context to answer the
+      question. If you don't know the answer, just say that you
+      don't know. Use three sentences maximum and keep the answer
+      concise.
+      \n\n
+      {context}`;
+    const qaPrompt = ChatPromptTemplate.fromMessages([
+      ["system", qaSystemPrompt],
+      new MessagesPlaceholder("chat_history"),
+      ["human", "{input}"],
+    ]);
+
+    const questionAnswerChain = await createStuffDocumentsChain({
+      llm: streamingModel,
+      prompt: qaPrompt,
+    });
+
+    const ragChain = await createRetrievalChain({
+      retriever: historyAwareRetriever,
+      combineDocsChain: questionAnswerChain,
+    });
 
     // Question using chat-history
-    // Reference https://js.langchain.com/docs/modules/chains/popular/chat_vector_db#externally-managed-memory
-    chain
-      .call(
-        {
-          question: sanitizedQuestion,
-          chat_history: chatHistory,
-        },
-        [handlers]
-      )
-      .then(async (res) => {
-        const sourceDocuments = res?.sourceDocuments;
-        const firstTwoDocuments = sourceDocuments.slice(0, 2);
-        const pageContents = firstTwoDocuments.map(
-          ({ pageContent }: { pageContent: string }) => pageContent
-        );
-        console.log("already appended ", data);
-        data.append({
-          sources: pageContents,
-        });
-        data.close();
-      });
+    const response = await ragChain.invoke({
+      chat_history: chatHistory,
+      input: sanitizedQuestion,
+    });
+
+    const sourceDocuments = response?.sourceDocuments;
+    const firstTwoDocuments = sourceDocuments.slice(0, 2);
+    const pageContents = firstTwoDocuments.map(
+      ({ pageContent }: { pageContent: string }) => pageContent
+    );
+
+    data.append({
+      sources: pageContents,
+    });
+    data.close();
 
     // Return the readable stream
     return new StreamingTextResponse(stream, {}, data);

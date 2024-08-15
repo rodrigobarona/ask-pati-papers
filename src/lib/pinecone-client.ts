@@ -1,4 +1,4 @@
-import { PineconeClient } from "@pinecone-database/pinecone";
+import { Pinecone as PineconeClient } from "@pinecone-database/pinecone";
 import { env } from "./config";
 import { delay } from "./utils";
 
@@ -33,7 +33,7 @@ async function initPineconeClient() {
       apiKey: env.PINECONE_API_KEY,
       environment: env.PINECONE_ENVIRONMENT,
     });
-    const indexName = env.PINECONE_INDEX_NAME;
+    const indexName = env.PINECONE_INDEX;
 
     const existingIndexes = await pineconeClient.listIndexes();
 
